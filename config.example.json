@@ -1,0 +1,16 @@
+{
+  "cookies": {
+    "SESSDATA": "你的SESSDATA",
+    "bili_jct": "你的bili_jct",
+    "DedeUserID": "你的DedeUserID"
+  },
+  "receptionist": {
+    "check_interval_minutes": 15,
+    "reply_delay_min": 3,
+    "reply_delay_max": 15,
+    "max_replies_per_hour": 30,
+    "quiet_hours": [0, 7],
+    "default_reply_style": "warm_healing",
+    "bot_name": "荒野小爪"
+  }
+}
