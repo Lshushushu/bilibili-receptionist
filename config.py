@@ -112,24 +112,29 @@ def get_receptionist_config() -> dict:
     """
     获取接待模块专属配置（带默认值）。
     Returns:
-        dict: 包含以下字段：
-            - check_interval_minutes: 检查间隔（分钟），默认 15
-            - reply_delay_min: 回复最小延迟（秒），默认 3
-            - reply_delay_max: 回复最大延迟（秒），默认 15
-            - max_replies_per_hour: 每小时最大回复数，默认 30
-            - quiet_hours: 静默时段 [start, end]，默认 [0, 7]
-            - default_reply_style: 默认回复风格，默认 "warm_healing"
+        dict: 包含防 412 风控的全部参数
     """
     config = load_config()
     defaults = {
-        "check_interval_minutes": 15,
-        "reply_delay_min": 3,
-        "reply_delay_max": 15,
+        "run_hours": [12, 1],
+        "full_scan_cooldown_minutes": 75,
+        "video_delay_min": 50,
+        "video_delay_max": 100,
+        "page_delay_min": 5,
+        "page_delay_max": 9,
+        "page_extra_delay_min": 2,
+        "page_extra_delay_max": 4,
+        "reply_delay_min": 12,
+        "reply_delay_max": 28,
+        "batch_size": 6,
         "max_replies_per_hour": 30,
-        "quiet_hours": [3, 7],
+        "quiet_hours": [0, 7],
         "default_reply_style": "warm_healing",
+        "bot_name": "荒野小爪",
+        "default_mode": "new",
         "auto_discover": True,
         "new_video_days": 3,
+        "pause_on_412_hours": 10,
     }
     receptionist = config.get("receptionist", {})
     return {**defaults, **receptionist}

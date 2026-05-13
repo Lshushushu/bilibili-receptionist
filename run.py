@@ -191,8 +191,8 @@ def main():
     parser.add_argument("--import-bvids", type=str, metavar="FILE", help="从 JSON 文件批量导入 BV 号")
     parser.add_argument("--export", action="store_true", help="导出监控列表为 JSON")
     parser.add_argument("--discover", action="store_true", help="自动发现频道所有视频并加入监控")
-    parser.add_argument("--mode", type=str, default="all", choices=["all", "new"],
-                        help="检查模式: all=所有视频, new=只检查近3天新视频")
+    parser.add_argument("--mode", type=str, default="new", choices=["all", "new"],
+                        help="检查模式: new=只检查近3天新视频(默认), all=所有视频")
 
     args = parser.parse_args()
 

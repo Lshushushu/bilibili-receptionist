@@ -1,6 +1,12 @@
 """
-bilibili-receptionist 主逻辑模块
-协调评论抓取 → 过滤 → 回复生成 → 发送 → 日志记录的完整流程。
+bilibili-receptionist 主逻辑模块（防 412 风控版）
+核心改动：
+- 批量回复模式：攒够 batch_size 条再集中发送
+- 固定运行时段：每天 12:00 和 01:00
+- 全量扫描后强制冷却 75 分钟
+- 412 熔断：立即停止 → 通知 → 暂停 10h → 退出
+- 视频间随机延迟 50~100 秒
+- 默认 new 模式
 """
 
 import json
@@ -12,6 +18,7 @@ from pathlib import Path
 
 import config as cfg
 import bilibili_api as api
+from bilibili_api import Bili412Error
 from reply_generator import generate_unique_reply, is_sensitive, SAFE_REPLY
 
 logger = logging.getLogger("receptionist")
@@ -30,7 +37,6 @@ class RepliedTracker:
         self._load()
 
     def _load(self):
-        """从文件加载"""
         if self.filepath.exists():
             try:
                 data = json.loads(self.filepath.read_text(encoding="utf-8"))
@@ -41,7 +47,6 @@ class RepliedTracker:
                 self._replied = set()
 
     def save(self):
-        """持久化到文件"""
         self.filepath.parent.mkdir(exist_ok=True)
         data = {
             "replied_rpids": sorted(self._replied),
@@ -51,11 +56,9 @@ class RepliedTracker:
         self.filepath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def is_replied(self, rpid: int | str) -> bool:
-        """检查是否已回复"""
         return str(rpid) in self._replied
 
     def mark_replied(self, rpid: int | str):
-        """标记为已回复"""
         self._replied.add(str(rpid))
 
     def __len__(self):
@@ -75,7 +78,6 @@ class MonitoredVideos:
         self._load()
 
     def _load(self):
-        """加载监控列表"""
         if self.filepath.exists():
             try:
                 data = json.loads(self.filepath.read_text(encoding="utf-8"))
@@ -84,28 +86,13 @@ class MonitoredVideos:
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning(f"监控视频文件损坏: {e}")
                 self._videos = []
-        else:
-            self._videos = []
 
     def save(self):
-        """持久化"""
         self.filepath.parent.mkdir(exist_ok=True)
-        data = {
-            "videos": self._videos,
-            "updated_at": datetime.now().isoformat(),
-        }
+        data = {"videos": self._videos, "updated_at": datetime.now().isoformat()}
         self.filepath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def add_video(self, bvid: str, title: str = "", priority: int = 0, pubdate: int = 0):
-        """
-        添加视频到监控列表。
-        Args:
-            bvid: BV号
-            title: 视频标题（可选）
-            priority: 优先级（0=普通, 1=新上传重点, 2=高优先）
-            pubdate: 视频发布时间（Unix时间戳，用于新旧判断）
-        """
-        # 去重
         for v in self._videos:
             if v["bvid"] == bvid:
                 v["priority"] = max(v.get("priority", 0), priority)
@@ -115,48 +102,24 @@ class MonitoredVideos:
                     v["pubdate"] = pubdate
                 self.save()
                 return
-
         self._videos.append({
-            "bvid": bvid,
-            "title": title,
-            "priority": priority,
-            "pubdate": pubdate,
-            "added_at": datetime.now().isoformat(),
+            "bvid": bvid, "title": title, "priority": priority,
+            "pubdate": pubdate, "added_at": datetime.now().isoformat(),
         })
         self.save()
         logger.info(f"新增监控视频: {bvid} (priority={priority})")
 
     def remove_video(self, bvid: str):
-        """移除视频"""
         self._videos = [v for v in self._videos if v["bvid"] != bvid]
         self.save()
 
     def get_sorted_videos(self) -> list[dict]:
-        """
-        获取按优先级排序的视频列表。
-        排序：priority 降序 → added_at 降序（新的优先）
-        """
-        return sorted(
-            self._videos,
-            key=lambda v: (v.get("priority", 0), v.get("added_at", "")),
-            reverse=True,
-        )
+        return sorted(self._videos, key=lambda v: (v.get("priority", 0), v.get("added_at", "")), reverse=True)
 
     def get_new_videos(self, days: int = 3) -> list[dict]:
-        """
-        获取近 N 天发布的新视频（按优先级排序）。
-        Args:
-            days: 天数阈值
-        Returns:
-            list[dict]: 新视频列表
-        """
         cutoff = time.time() - days * 86400
         new = [v for v in self._videos if v.get("pubdate", 0) >= cutoff]
-        return sorted(
-            new,
-            key=lambda v: (v.get("priority", 0), v.get("pubdate", 0)),
-            reverse=True,
-        )
+        return sorted(new, key=lambda v: (v.get("priority", 0), v.get("pubdate", 0)), reverse=True)
 
     def __len__(self):
         return len(self._videos)
@@ -167,51 +130,36 @@ class MonitoredVideos:
 # ============================================================
 
 class RateLimiter:
-    """回复频率控制"""
-
     def __init__(self, max_per_hour: int = 30):
         self.max_per_hour = max_per_hour
         self._timestamps: list[float] = []
 
     def can_reply(self) -> bool:
-        """检查是否可以发送回复"""
         now = time.time()
-        # 清理超过1小时的记录
         self._timestamps = [t for t in self._timestamps if now - t < 3600]
         return len(self._timestamps) < self.max_per_hour
 
     def record_reply(self):
-        """记录一次回复"""
         self._timestamps.append(time.time())
 
     @property
-    def remaining(self) -> bool:
-        """本小时剩余可用次数"""
+    def remaining(self) -> int:
         now = time.time()
         self._timestamps = [t for t in self._timestamps if now - t < 3600]
         return self.max_per_hour - len(self._timestamps)
 
 
 # ============================================================
-# 日志记录
+# 日志
 # ============================================================
 
 def setup_logging(log_level: str = "INFO"):
-    """配置日志"""
     log_path = cfg.get_log_path()
-    formatter = logging.Formatter(
-        "%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # 文件 handler
+    formatter = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
-
-    # 控制台 handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-
     root_logger = logging.getLogger("receptionist")
     root_logger.setLevel(getattr(logging, log_level, logging.INFO))
     root_logger.addHandler(file_handler)
@@ -219,20 +167,12 @@ def setup_logging(log_level: str = "INFO"):
 
 
 def log_reply(bvid: str, rpid: int, user_name: str, comment: str, reply: str, video_title: str = ""):
-    """记录单条回复到日志"""
-    logger.info(
-        f"[回复] bvid={bvid} | 用户={user_name} | "
-        f"评论={comment[:50]}... | 回复={reply[:50]}..."
-    )
-    # 同时写入结构化日志
+    logger.info(f"[回复] bvid={bvid} | 用户={user_name} | 评论={comment[:50]}... | 回复={reply[:50]}...")
     log_entry = {
         "time": datetime.now().isoformat(),
-        "bvid": bvid,
-        "video_title": video_title,
-        "rpid": rpid,
-        "user_name": user_name,
-        "comment": comment,
-        "reply": reply,
+        "bvid": bvid, "video_title": video_title,
+        "rpid": rpid, "user_name": user_name,
+        "comment": comment, "reply": reply,
     }
     log_path = cfg.get_log_path()
     structured_path = log_path.with_suffix(".jsonl")
@@ -241,29 +181,16 @@ def log_reply(bvid: str, rpid: int, user_name: str, comment: str, reply: str, vi
 
 
 # ============================================================
-# 评论过滤与优先级排序
+# 评论过滤与排序
 # ============================================================
 
 def filter_comments(replies: list[dict], tracker: RepliedTracker, bot_uid: str) -> list[dict]:
-    """
-    过滤评论，移除已回复、自己的评论、空评论。
-    Args:
-        replies: 原始评论列表
-        tracker: 已回复追踪器
-        bot_uid: 当前用户 UID（排除自己的评论）
-    Returns:
-        list[dict]: 过滤后的评论
-    """
     filtered = []
     for r in replies:
-        rpid = r["rpid"]
-        # 跳过已回复
-        if tracker.is_replied(rpid):
+        if tracker.is_replied(r["rpid"]):
             continue
-        # 跳过自己的评论
         if str(r["user_mid"]) == str(bot_uid):
             continue
-        # 跳过空评论
         if not r["message"].strip():
             continue
         filtered.append(r)
@@ -271,44 +198,124 @@ def filter_comments(replies: list[dict], tracker: RepliedTracker, bot_uid: str) 
 
 
 def prioritize_comments(replies: list[dict], video_priority: int = 0) -> list[dict]:
-    """
-    对评论进行优先级排序。
-    优先级规则：
-    1. @阿树__atree 的评论（包含 @ 或 提及 UP主名）
-    2. 高赞评论（like_count > 5）
-    3. 有回复数的评论（说明有人在讨论）
-    4. 视频优先级加成
-    Args:
-        replies: 过滤后的评论列表
-        video_priority: 视频优先级
-    Returns:
-        list[dict]: 排序后的评论
-    """
     def score(r: dict) -> int:
         s = 0
         msg = r["message"]
-        # @ UP主 或 提及
         if "@" in msg or "阿树" in msg:
             s += 100
-        # 高赞
         if r["like_count"] >= 10:
             s += 50
         elif r["like_count"] >= 5:
             s += 30
         elif r["like_count"] >= 1:
             s += 10
-        # 有讨论
         if r["reply_count"] > 0:
             s += 20
-        # 视频优先级
         s += video_priority * 10
         return s
-
     return sorted(replies, key=score, reverse=True)
 
 
 # ============================================================
-# 单视频处理流程
+# 批量回复模式
+# ============================================================
+
+def _collect_unreplied_comments(
+    bvid: str,
+    tracker: RepliedTracker,
+    max_comments: int = 20,
+) -> list[dict]:
+    """
+    收集单个视频的未回复评论（只抓取，不回复）。
+    """
+    if api.is_412_triggered():
+        return []
+
+    try:
+        aid = api.bvid_to_aid(bvid)
+    except Bili412Error:
+        raise
+    except api.BiliAPIError as e:
+        logger.error(f"BV号转换失败: {bvid}, {e}")
+        return []
+
+    replies = api.fetch_all_comments(aid, mode=api.MODE_TIME)
+    if not replies:
+        return []
+
+    bot_uid = cfg.get_uid()
+    filtered = filter_comments(replies, tracker, bot_uid)
+    prioritized = prioritize_comments(filtered)
+    return prioritized[:max_comments]
+
+
+def _send_batch_replies(
+    comments: list[dict],
+    bvid: str,
+    tracker: RepliedTracker,
+    rate_limiter: RateLimiter,
+    video_title: str = "",
+) -> int:
+    """
+    批量发送回复。
+    """
+    if api.is_412_triggered():
+        return 0
+
+    try:
+        aid = api.bvid_to_aid(bvid)
+    except Bili412Error:
+        raise
+    except api.BiliAPIError as e:
+        logger.error(f"BV号转换失败: {bvid}, {e}")
+        return 0
+
+    rconf = cfg.get_receptionist_config()
+    reply_count = 0
+
+    for comment in comments:
+        if api.is_412_triggered():
+            logger.warning("412 熔断中，停止发送")
+            break
+        if not rate_limiter.can_reply():
+            logger.warning("本小时回复已达上限，停止")
+            break
+
+        reply_text = generate_unique_reply(
+            comment_message=comment["message"],
+            comment_user=comment["user_name"],
+            video_title=video_title,
+        )
+        if not reply_text:
+            continue
+
+        root = comment["rpid"] if comment["root"] == 0 else comment["root"]
+        parent = comment["rpid"]
+        try:
+            result = api.safe_send_reply(aid, reply_text, parent_rpid=parent, root_rpid=root)
+        except Bili412Error:
+            raise
+
+        if not result:
+            logger.error(f"回复发送失败: rpid={comment['rpid']}")
+            continue
+
+        tracker.mark_replied(comment["rpid"])
+        rate_limiter.record_reply()
+        reply_count += 1
+
+        log_reply(
+            bvid=bvid, rpid=comment["rpid"],
+            user_name=comment["user_name"],
+            comment=comment["message"], reply=reply_text,
+            video_title=video_title,
+        )
+
+    return reply_count
+
+
+# ============================================================
+# 单视频处理（批量模式）
 # ============================================================
 
 def process_video(
@@ -317,133 +324,60 @@ def process_video(
     rate_limiter: RateLimiter,
     video_priority: int = 0,
     video_title: str = "",
-    max_replies: int = 0,
+    batch_size: int = 6,
 ) -> int:
     """
-    处理单个视频的评论。
-    Args:
-        bvid: BV号
-        tracker: 已回复追踪器
-        rate_limiter: 频率控制器
-        video_priority: 视频优先级
-        video_title: 视频标题
-        max_replies: 本次最大回复数（0=不限，受 rate_limiter 控制）
-    Returns:
-        int: 实际回复数
+    处理单个视频：收集未回复评论 → 攒够 batch_size 条 → 集中发送。
     """
-    # 静默时段检查
     if cfg.is_quiet_hours():
-        logger.info("当前为静默时段，跳过处理")
+        logger.info("当前为静默时段，跳过")
         return 0
-
-    # 获取 AID
-    try:
-        aid = api.bvid_to_aid(bvid)
-    except api.BiliAPIError as e:
-        logger.error(f"BV号转换失败: {bvid}, {e}")
+    if api.is_412_triggered():
         return 0
 
     if not video_title:
         try:
             info = api.get_video_info(bvid)
             video_title = info.get("title", "")
+        except Bili412Error:
+            raise
         except Exception:
             pass
 
-    # 抓取全部评论（翻页遍历）
-    replies = api.fetch_all_comments(aid, mode=api.MODE_TIME)
-    if not replies:
-        logger.debug(f"无新评论: {bvid}")
+    # 收集未回复评论
+    try:
+        comments = _collect_unreplied_comments(bvid, tracker)
+    except Bili412Error:
+        raise
+
+    if not comments:
+        logger.debug(f"无待处理评论: {bvid}")
         return 0
 
-    # 过滤
-    bot_uid = cfg.get_uid()
-    filtered = filter_comments(replies, tracker, bot_uid)
-    if not filtered:
-        logger.debug(f"过滤后无待处理评论: {bvid}")
-        return 0
+    # 只取 batch_size 条
+    batch = comments[:batch_size]
+    logger.info(f"[{bvid}] 收集到 {len(comments)} 条待回复，本轮处理 {len(batch)} 条")
 
-    # 优先级排序
-    prioritized = prioritize_comments(filtered, video_priority)
+    # 批量发送
+    try:
+        count = _send_batch_replies(batch, bvid, tracker, rate_limiter, video_title)
+    except Bili412Error:
+        raise
 
-    # 逐条处理
-    reply_count = 0
-    rconf = cfg.get_receptionist_config()
-    delay_min = rconf["reply_delay_min"]
-    delay_max = rconf["reply_delay_max"]
-
-    for comment in prioritized:
-        # 频率检查
-        if not rate_limiter.can_reply():
-            logger.warning(f"本小时回复已达上限，停止处理")
-            break
-
-        # 最大回复数检查
-        if max_replies > 0 and reply_count >= max_replies:
-            logger.info(f"已达本次最大回复数 ({max_replies})，停止")
-            break
-
-        # 生成回复
-        reply_text = generate_unique_reply(
-            comment_message=comment["message"],
-            comment_user=comment["user_name"],
-            video_title=video_title,
-        )
-        if not reply_text:
-            logger.warning(f"回复生成失败: rpid={comment['rpid']}")
-            continue
-
-        # 发送回复（作为子评论回复目标评论，而不是新建顶层评论）
-        # 顶层评论(root==0): root_rpid 和 parent_rpid 都用自身 rpid
-        # 子评论(root!=0): root_rpid 用 root，parent_rpid 用自身 rpid
-        root = comment["rpid"] if comment["root"] == 0 else comment["root"]
-        parent = comment["rpid"]
-        result = api.safe_send_reply(aid, reply_text, parent_rpid=parent, root_rpid=root)
-        if not result:
-            logger.error(f"回复发送失败: rpid={comment['rpid']}")
-            continue
-
-        # 成功
-        tracker.mark_replied(comment["rpid"])
-        rate_limiter.record_reply()
-        reply_count += 1
-
-        log_reply(
-            bvid=bvid,
-            rpid=comment["rpid"],
-            user_name=comment["user_name"],
-            comment=comment["message"],
-            reply=reply_text,
-            video_title=video_title,
-        )
-
-        # 随机延迟（防风控）
-        delay = random.uniform(delay_min, delay_max)
-        logger.debug(f"等待 {delay:.1f}s 后处理下一条...")
-        time.sleep(delay)
-
-    return reply_count
+    return count
 
 
 # ============================================================
-# 主循环
+# 一轮完整扫描
 # ============================================================
 
 def run_once(
     tracker: RepliedTracker | None = None,
     videos: MonitoredVideos | None = None,
-    max_replies_per_video: int = 0,
-    mode: str = "all",
+    mode: str | None = None,
 ) -> dict:
     """
-    执行一轮完整检查。
-    Args:
-        tracker: 已回复追踪器（可选，自动创建）
-        videos: 监控视频列表（可选，自动加载）
-        max_replies_per_video: 每个视频最大回复数
-        mode: "all"=检查所有视频, "new"=只检查近3天新视频
-    Returns:
-        dict: {"total_replies": int, "videos_processed": int, "details": list}
+    执行一轮完整扫描。
     """
     if tracker is None:
         tracker = RepliedTracker()
@@ -452,12 +386,16 @@ def run_once(
 
     rconf = cfg.get_receptionist_config()
     rate_limiter = RateLimiter(rconf["max_replies_per_hour"])
+    batch_size = rconf.get("batch_size", 6)
 
-    # 根据模式选择视频列表
+    # 默认模式从配置读取
+    if mode is None:
+        mode = rconf.get("default_mode", "new")
+
     if mode == "new":
         new_days = rconf.get("new_video_days", 3)
         video_list = videos.get_new_videos(days=new_days)
-        logger.info(f"[new模式] 只检查近{new_days}天的新视频，共 {len(video_list)} 个")
+        logger.info(f"[new模式] 检查近{new_days}天新视频，共 {len(video_list)} 个")
     else:
         video_list = videos.get_sorted_videos()
         logger.info(f"[all模式] 检查所有视频，共 {len(video_list)} 个")
@@ -465,84 +403,160 @@ def run_once(
     total_replies = 0
     details = []
 
-    for video in video_list:
+    for i, video in enumerate(video_list):
+        if api.is_412_triggered():
+            logger.warning("412 熔断中，停止本轮扫描")
+            break
+
         bvid = video["bvid"]
         priority = video.get("priority", 0)
         title = video.get("title", "")
 
-        logger.info(f"处理视频: {bvid} (priority={priority}, title={title[:20]}...)")
+        logger.info(f"处理视频 [{i+1}/{len(video_list)}]: {bvid} (priority={priority}, title={title[:20]}...)")
 
-        count = process_video(
-            bvid=bvid,
-            tracker=tracker,
-            rate_limiter=rate_limiter,
-            video_priority=priority,
-            video_title=title,
-            max_replies=max_replies_per_video,
-        )
+        try:
+            count = process_video(
+                bvid=bvid, tracker=tracker, rate_limiter=rate_limiter,
+                video_priority=priority, video_title=title,
+                batch_size=batch_size,
+            )
+        except Bili412Error:
+            logger.critical("412 触发，中断本轮")
+            break
 
         total_replies += count
         details.append({"bvid": bvid, "replies": count, "title": title})
 
-        if count > 0:
-            # 视频间额外延迟
-            time.sleep(random.uniform(2, 5))
+        # 视频间随机延迟 50~100 秒
+        if i < len(video_list) - 1:
+            video_delay = random.uniform(
+                rconf.get("video_delay_min", 50),
+                rconf.get("video_delay_max", 100),
+            )
+            logger.info(f"视频间延迟: {video_delay:.0f}s")
+            time.sleep(video_delay)
 
-    # 持久化
     tracker.save()
-
     logger.info(f"本轮完成: 处理 {len(details)} 个视频, 发送 {total_replies} 条回复")
-    return {
-        "total_replies": total_replies,
-        "videos_processed": len(details),
-        "details": details,
-    }
+    return {"total_replies": total_replies, "videos_processed": len(details), "details": details}
 
 
-def run_loop(interval_minutes: int | None = None):
+# ============================================================
+# 412 熔断处理
+# ============================================================
+
+def handle_412_circuit_break():
     """
-    定时循环运行。
-    Args:
-        interval_minutes: 检查间隔（分钟），默认从配置读取
+    412 熔断：通知 → 暂停 10 小时 → 退出
     """
     rconf = cfg.get_receptionist_config()
-    interval = interval_minutes or rconf["check_interval_minutes"]
+    pause_hours = rconf.get("pause_on_412_hours", 10)
 
-    logger.info(f"启动接待循环，间隔 {interval} 分钟")
+    logger.critical(
+        f"\n{'='*60}\n"
+        f"🚨 412 风控触发 — 进入熔断模式\n"
+        f"将暂停 {pause_hours} 小时后自动退出。\n"
+        f"{'='*60}"
+    )
+
+    # TODO: 这里可以接入微信/钉钉/邮件通知
+    # notify_412(pause_hours)
+
+    logger.info(f"开始暂停 {pause_hours} 小时 ({pause_hours * 3600} 秒)...")
+    time.sleep(pause_hours * 3600)
+
+    logger.info("暂停结束，保存状态并退出程序")
+    return
+
+
+# ============================================================
+# 定时调度：每天 12:00 和 01:00
+# ============================================================
+
+def _seconds_until_next_run(run_hours: list[int]) -> int:
+    """计算距离下一个运行时刻的秒数"""
+    now = datetime.now()
+    candidates = []
+    for hour in run_hours:
+        target_today = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target_today > now:
+            candidates.append(target_today)
+        # 明天的这个时刻
+        candidates.append(target_today + timedelta(days=1))
+
+    if not candidates:
+        return 3600  # fallback
+
+    next_run = min(candidates)
+    delta = (next_run - now).total_seconds()
+    return max(int(delta), 1)
+
+
+def run_loop():
+    """
+    定时循环：每天 12:00 和 01:00 各执行一轮。
+    全量扫描后强制冷却 75 分钟。
+    412 触发时立即停止 → 暂停 → 退出。
+    """
+    rconf = cfg.get_receptionist_config()
+    run_hours = rconf.get("run_hours", [12, 1])
+    cooldown_minutes = rconf.get("full_scan_cooldown_minutes", 75)
+    default_mode = rconf.get("default_mode", "new")
 
     tracker = RepliedTracker()
     videos = MonitoredVideos()
-
-    # 启动时自动发现视频（如果配置启用）
-    rconf = cfg.get_receptionist_config()
-    if rconf.get("auto_discover", False):
-        uid = cfg.get_uid()
-        logger.info(f"自动发现模式：拉取用户 {uid} 的所有视频...")
-        try:
-            all_videos = api.fetch_all_user_videos(int(uid))
-            for v in all_videos:
-                videos.add_video(v["bvid"], title=v.get("title", ""), priority=0, pubdate=v.get("created", 0))
-            logger.info(f"自动发现完成，当前监控 {len(videos)} 个视频")
-        except Exception as e:
-            logger.warning(f"自动发现失败: {e}，使用已有监控列表")
 
     # 启动时检测 Cookie
     if not api.check_cookie_valid():
         logger.error("Cookie 无效，请更新 config.json 后重启")
         return
 
-    logger.info("Cookie 有效，开始接待")
+    logger.info(f"Cookie 有效。运行时段: {run_hours}:00，默认模式: {default_mode}")
+
+    # 自动发现
+    if rconf.get("auto_discover", False):
+        uid = cfg.get_uid()
+        logger.info(f"自动发现：拉取用户 {uid} 的视频...")
+        try:
+            all_videos = api.fetch_all_user_videos(int(uid))
+            for v in all_videos:
+                videos.add_video(v["bvid"], title=v.get("title", ""), priority=0, pubdate=v.get("created", 0))
+            logger.info(f"自动发现完成，监控 {len(videos)} 个视频")
+        except Exception as e:
+            logger.warning(f"自动发现失败: {e}")
 
     while True:
         try:
-            result = run_once(tracker, videos)
+            # 等待到下一个运行时刻
+            wait_seconds = _seconds_until_next_run(run_hours)
+            next_run = datetime.now() + timedelta(seconds=wait_seconds)
+            logger.info(f"下次运行: {next_run.strftime('%Y-%m-%d %H:%M:%S')} (等待 {wait_seconds/60:.0f} 分钟)")
+            time.sleep(wait_seconds)
+
+            # 执行一轮
+            logger.info("=" * 50)
+            logger.info("开始新一轮全量扫描")
+            logger.info("=" * 50)
+
+            result = run_once(tracker, videos, mode=default_mode)
             logger.info(f"本轮结果: {result['total_replies']} 条回复")
+
+            # 412 检查
+            if api.is_412_triggered():
+                handle_412_circuit_break()
+                break
+
+            # 全量扫描后强制冷却
+            logger.info(f"全量扫描完成，强制冷却 {cooldown_minutes} 分钟...")
+            time.sleep(cooldown_minutes * 60)
+
         except KeyboardInterrupt:
             logger.info("收到中断信号，保存并退出")
             tracker.save()
             break
+        except Bili412Error:
+            handle_412_circuit_break()
+            break
         except Exception as e:
             logger.error(f"运行异常: {e}", exc_info=True)
-
-        logger.info(f"等待 {interval} 分钟后再次检查...")
-        time.sleep(interval * 60)
+            time.sleep(300)  # 异常后等 5 分钟再试
